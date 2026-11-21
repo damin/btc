@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: btc-24h-gex-dashboard
+    runtime: python
+    region: virginia
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 --threads 4 --timeout 60 -b 0.0.0.0:$PORT dashboard_app:app
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: REFRESH_INTERVAL_SEC
+        value: "300"
+      - key: USE_DEMO
+        value: "0"
+      - key: EXCHANGE_SOURCE
+        value: "auto"
