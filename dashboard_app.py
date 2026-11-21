@@ -17,7 +17,11 @@ from btc_24h_predictor import (
     ExtremeBoundaryEngine,
     PredictionOutput,
 )
-from live_adapter import GLOBAL_EXCHANGE_CIRCUIT, ProductionAPIAdapter
+from live_adapter import (
+    GLOBAL_ETF_CACHE,
+    GLOBAL_EXCHANGE_CIRCUIT,
+    ProductionAPIAdapter,
+)
 
 
 def _load_local_dotenv() -> None:
@@ -130,7 +134,8 @@ class DashboardStateStore:
         if self.exchange_source not in ("auto", "okx", "deribit"):
             self.exchange_source = "auto"
         self.proxy: Optional[str] = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
-        self.manual_etf_netflow_usd: float = 0.0
+        # None = 自动抓取 SoSoValue/Farside；填数值 = 手动覆盖
+        self.manual_etf_netflow_usd: Optional[float] = None
         self.manual_polymarket_bias: Optional[float] = None
 
         self.snapshot: Optional[Dict[str, Any]] = None
@@ -143,7 +148,7 @@ class DashboardStateStore:
         mode: str,
         exchange_source: str,
         proxy: Optional[str],
-        etf_netflow: float,
+        etf_override_usd: Optional[float],
         poly_bias: Optional[float],
     ) -> Dict[str, Any]:
         if mode == "DEMO":
@@ -171,12 +176,15 @@ class DashboardStateStore:
                     "oi_24h_pct": deriv.oi_change_24h_pct,
                     "fear_greed": senti.fear_greed_index,
                     "active_contracts": 148,
+                    "etf_netflow_m": round(tech.spot_etf_netflow_usd / 1e6, 2),
+                    "etf_date": "2026-11-20",
+                    "etf_source": "Demo Snapshot",
                 },
                 "strike_gex_bars": _demo_strike_gex_bars(),
                 "alert": alert,
                 "config": {
                     "exchange_source": exchange_source,
-                    "etf_netflow_m": round(etf_netflow / 1e6, 2),
+                    "etf_override_m": round(etf_override_usd / 1e6, 2) if etf_override_usd is not None else None,
                     "polymarket_bias": poly_bias,
                 },
             }
@@ -186,13 +194,15 @@ class DashboardStateStore:
             deribit_perp="BTC-PERPETUAL",
             exchange_source=exchange_source,
             circuit=GLOBAL_EXCHANGE_CIRCUIT,
+            etf_cache=GLOBAL_ETF_CACHE,
             proxy=proxy,
-            manual_etf_netflow_usd=etf_netflow,
+            manual_etf_netflow_usd=etf_override_usd,
             manual_polymarket_bias=poly_bias,
         ) as adapter:
             pipeline = BTC24HPredictorPipeline(adapter=adapter)
             pred = await pipeline.run_once()
             gex = adapter.last_gex_profile
+            etf = adapter.latest_etf
             alert = _evaluate_alert_state(
                 pred,
                 candle_1h_close=adapter.last_1h_close,
@@ -215,17 +225,20 @@ class DashboardStateStore:
                     "oi_24h_pct": adapter.latest_oi_24h_pct,
                     "fear_greed": adapter.latest_fng,
                     "active_contracts": gex.active_contracts if gex else 0,
+                    "etf_netflow_m": round(etf.netflow_usd / 1e6, 2),
+                    "etf_date": etf.trade_date,
+                    "etf_source": etf.source,
                 },
                 "strike_gex_bars": adapter.strike_gex_bars,
                 "alert": alert,
                 "config": {
                     "exchange_source": exchange_source,
-                    "etf_netflow_m": round(etf_netflow / 1e6, 2),
+                    "etf_override_m": round(etf_override_usd / 1e6, 2) if etf_override_usd is not None else None,
                     "polymarket_bias": poly_bias,
                 },
             }
 
-    def refresh_now(self) -> Tuple[bool, Optional[str]]:
+    def refresh_now(self, force_etf_refresh: bool = False) -> Tuple[bool, Optional[str]]:
         with self._lock:
             if self._refreshing:
                 return False, "已有刷新任务正在执行中"
@@ -233,12 +246,15 @@ class DashboardStateStore:
             mode = self.mode
             exchange_source = self.exchange_source
             proxy = self.proxy
-            etf_netflow = self.manual_etf_netflow_usd
+            etf_override = self.manual_etf_netflow_usd
             poly_bias = self.manual_polymarket_bias
+
+        if force_etf_refresh:
+            GLOBAL_ETF_CACHE.clear()
 
         try:
             payload = asyncio.run(
-                self._fetch_payload_async(mode, exchange_source, proxy, etf_netflow, poly_bias)
+                self._fetch_payload_async(mode, exchange_source, proxy, etf_override, poly_bias)
             )
             now_ep = time.time()
             with self._lock:
@@ -261,8 +277,8 @@ class DashboardStateStore:
         self,
         mode: Optional[str] = None,
         exchange_source: Optional[str] = None,
-        etf_netflow_m: Optional[float] = None,
-        polymarket_bias: Optional[str] = None,
+        etf_netflow_m: Optional[Any] = None,
+        polymarket_bias: Optional[Any] = None,
     ) -> None:
         with self._lock:
             if mode in ("LIVE", "DEMO"):
@@ -272,7 +288,8 @@ class DashboardStateStore:
                 if exchange_source in ("auto", "okx"):
                     GLOBAL_EXCHANGE_CIRCUIT.reset_primary()
             if etf_netflow_m is not None:
-                self.manual_etf_netflow_usd = float(etf_netflow_m) * 1e6
+                text = str(etf_netflow_m).strip()
+                self.manual_etf_netflow_usd = None if text == "" else float(text) * 1e6
             if polymarket_bias is not None:
                 text = str(polymarket_bias).strip()
                 self.manual_polymarket_bias = None if text == "" else max(-1.0, min(1.0, float(text)))
@@ -286,6 +303,7 @@ class DashboardStateStore:
                 "mode": self.mode,
                 "exchange_source": self.exchange_source,
                 "primary_cooldown_sec": GLOBAL_EXCHANGE_CIRCUIT.remaining_cooldown_sec,
+                "etf_last_error": GLOBAL_ETF_CACHE.last_error,
                 "refreshing": self._refreshing,
                 "refresh_interval_sec": REFRESH_INTERVAL_SEC,
                 "seconds_to_next_refresh": seconds_to_next,
@@ -340,6 +358,7 @@ def healthz():
             "status": "ok",
             "mode": store.mode,
             "active_exchange": snap.get("active_exchange", "INITIALIZING"),
+            "etf_source": (snap.get("market_meta") or {}).get("etf_source", "--"),
         }
     )
 
@@ -352,7 +371,7 @@ def api_snapshot():
 
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
-    ok, err = store.refresh_now()
+    ok, err = store.refresh_now(force_etf_refresh=True)
     state = store.get_state_json()
     state["manual_refresh_ok"] = ok
     if err:
@@ -373,12 +392,12 @@ def api_config():
     except (ValueError, TypeError) as exc:
         return jsonify({"ok": False, "error": f"参数格式错误: {exc}"}), 400
 
-    store.refresh_now()
+    store.refresh_now(force_etf_refresh=(str(body.get("etf_netflow_m", "")).strip() == ""))
     return jsonify(store.get_state_json())
 
 
 # =============================================================================
-# 3. 内嵌暗色量化终端前端 (零构建单文件 HTML + Chart.js)
+# 3. 内嵌暗色量化终端前端 (V4: 自动 ETF 净流入遥测 + 留空自动恢复)
 # =============================================================================
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -386,7 +405,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>BTC 24H 极值磁吸带 & Deribit GEX 实时看板 (V3)</title>
+  <title>BTC 24H 极值磁吸带 & Deribit GEX 实时看板 (V4)</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
   <style>
     :root {
@@ -458,12 +477,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .alert-title { font-size: 14px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
     .alert-desc { font-size: 12.5px; color: var(--text); opacity: 0.9; margin-top: 3px; }
     .alert-triggers { display: flex; gap: 14px; font-size: 12px; }
-    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
     .card {
       background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px;
     }
     .kpi-label { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; }
-    .kpi-val { font-size: 22px; font-weight: 700; margin-top: 5px; }
+    .kpi-val { font-size: 21px; font-weight: 700; margin-top: 5px; }
     .kpi-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
     .main-grid { display: grid; grid-template-columns: 1.05fr 1.35fr; gap: 16px; }
     @media (max-width: 1040px) { .main-grid { grid-template-columns: 1fr; } }
@@ -524,6 +543,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="sub mono">最后更新: <span id="lastUpdated">--</span> · 下次 5 分钟自动刷新: <span id="countdown">--</span>s</div>
       </div>
       <div class="controls">
+        <span id="etfPill" class="pill">--</span>
         <span id="exchangePill" class="pill">--</span>
         <span id="modePill" class="pill">--</span>
         <button id="btnToggleMode" class="secondary" onclick="toggleMode()">切换 DEMO / LIVE</button>
@@ -536,8 +556,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     <div id="alertBanner" class="alert-banner NORMAL">
       <div>
-        <div class="alert-title" id="alertTitle">正在初始化行情与期权链...</div>
-        <div class="alert-desc" id="alertMsg">等待后台协程完成首次 OKX + Deribit 并发抓取。</div>
+        <div class="alert-title" id="alertTitle">正在初始化行情、期权链与美国现货 ETF 流量...</div>
+        <div class="alert-desc" id="alertMsg">等待后台协程完成首次 OKX + Deribit + ETF 自动抓取。</div>
       </div>
       <div class="alert-triggers mono">
         <div>向上熔断: <strong id="invBull" style="color:var(--red)">--</strong></div>
@@ -560,6 +580,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="kpi-label">Deribit 净 Gamma (Net GEX)</div>
         <div class="kpi-val mono" id="kpiGex">--</div>
         <div class="kpi-sub mono" id="kpiWalls">Flip: -- | Put/Call Wall: --</div>
+      </div>
+      <div class="card">
+        <div class="kpi-label">美国现货 ETF 单日净流入 (自动)</div>
+        <div class="kpi-val mono" id="kpiEtf">--</div>
+        <div class="kpi-sub mono" id="kpiEtfMeta">日期: -- | 来源: --</div>
       </div>
       <div class="card">
         <div class="kpi-label">舆情反身性得分 &amp; 资金费率</div>
@@ -591,8 +616,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="footer-grid">
       <div class="card">
         <div class="panel-header">
-          <div class="panel-title">永续数据源路由 &amp; 盘中手工因子注入</div>
-          <div class="panel-meta">美国直连免代理 · 支持 OKX / Deribit 实时切换与 ETF 因子补充</div>
+          <div class="panel-title">数据源路由 &amp; 可选手动覆盖</div>
+          <div class="panel-meta">现货 ETF 已启用自动抓取 · 下方输入框留空即保持全自动</div>
         </div>
         <div class="form-row">
           <div class="field">
@@ -604,8 +629,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </select>
           </div>
           <div class="field">
-            <label>现货 ETF 净流入 ($M)</label>
-            <input id="inputEtf" type="number" step="1" placeholder="如 -124.5" value="0" />
+            <label>ETF 净流入覆盖 ($M，留空=自动)</label>
+            <input id="inputEtf" type="number" step="0.1" placeholder="留空自动抓取" />
           </div>
           <div class="field">
             <label>Polymarket 偏移 (-1~+1)</label>
@@ -774,11 +799,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     exPill.textContent = "永续源: " + (active_exchange || "--");
     exPill.className = "pill " + (active_exchange === "OKX" ? "live" : (active_exchange === "DERIBIT" ? "alt" : "demo"));
 
+    const etfVal = Number(meta.etf_netflow_m || 0);
+    const etfPill = document.getElementById("etfPill");
+    etfPill.textContent = `ETF: ${etfVal >= 0 ? "+" : ""}${etfVal.toFixed(1)}M`;
+    etfPill.className = "pill " + (etfVal > 0 ? "live" : (etfVal < 0 ? "demo" : "alt"));
+
     const fBar = document.getElementById("failoverBar");
+    const notices = [];
     if (failover_reason && currentMode === "LIVE") {
+      const cd = resp.primary_cooldown_sec > 0 ? `（OKX 冷却剩余 ${Math.ceil(resp.primary_cooldown_sec / 60)}m）` : "";
+      notices.push(`永续路由: ${failover_reason}${cd}`);
+    }
+    if (resp.etf_last_error && currentMode === "LIVE" && String(meta.etf_source || "").startsWith("Auto Failed")) {
+      notices.push(`ETF 自动抓取提示: ${resp.etf_last_error}（在 .env 配置免费 SOSO_API_KEY 即可 100% 稳定自动拉取）`);
+    }
+    if (notices.length > 0) {
       fBar.style.display = "block";
-      const cd = resp.primary_cooldown_sec > 0 ? `（OKX 冷却探测剩余 ${Math.ceil(resp.primary_cooldown_sec / 60)} 分钟）` : "";
-      fBar.textContent = `数据源路由状态: ${failover_reason}${cd}`;
+      fBar.textContent = notices.join("  |  ");
     } else {
       fBar.style.display = "none";
     }
@@ -800,6 +837,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     gexEl.textContent = `${meta.net_gex_m >= 0 ? "+" : ""}${meta.net_gex_m.toFixed(2)}M`;
     gexEl.style.color = meta.net_gex_m >= 0 ? "var(--green)" : "var(--red)";
     document.getElementById("kpiWalls").textContent = `Flip: ${fmtUSD(meta.gamma_flip)} | PW ${fmtUSD(meta.put_wall)} / CW ${fmtUSD(meta.call_wall)}`;
+
+    const etfEl = document.getElementById("kpiEtf");
+    etfEl.textContent = `${etfVal >= 0 ? "+" : ""}$${Math.abs(etfVal).toFixed(1)}M`;
+    etfEl.style.color = etfVal > 0 ? "var(--green)" : (etfVal < 0 ? "var(--red)" : "var(--text)");
+    document.getElementById("kpiEtfMeta").textContent = `交易日: ${meta.etf_date || "--"} | ${meta.etf_source || "--"}`;
 
     document.getElementById("kpiSent").textContent = `${pred.raw_sentiment >= 0 ? "+" : ""}${pred.raw_sentiment.toFixed(2)} → ${pred.adjusted_sentiment >= 0 ? "+" : ""}${pred.adjusted_sentiment.toFixed(2)}`;
     document.getElementById("kpiFund").textContent = `8H费率: ${meta.funding_rate_pct}% | F&G: ${meta.fear_greed} | 24H OI: ${meta.oi_24h_pct >= 0 ? "+" : ""}${meta.oi_24h_pct}%`;
@@ -853,16 +895,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   async function applyConfig() {
-    const etfVal = parseFloat(document.getElementById("inputEtf").value || "0");
-    const polyVal = document.getElementById("inputPoly").value;
+    const etfStr = document.getElementById("inputEtf").value;
+    const polyStr = document.getElementById("inputPoly").value;
     const srcVal = document.getElementById("selectSource").value;
     const res = await fetch("/api/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         exchange_source: srcVal,
-        etf_netflow_m: isNaN(etfVal) ? 0 : etfVal,
-        polymarket_bias: polyVal,
+        etf_netflow_m: etfStr,
+        polymarket_bias: polyStr,
       }),
     });
     const json = await res.json();

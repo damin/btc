@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -24,7 +26,172 @@ from btc_24h_predictor import (
 
 
 # =============================================================================
-# 1. Deribit 期权链 Black-Scholes Gamma & GEX 实时计算引擎
+# 1. 美国现货 BTC ETF 净流入自动抓取引擎 (SoSoValue API -> Farside HTML 瀑布流)
+# =============================================================================
+
+@dataclass(frozen=True)
+class ETFFlowSnapshot:
+    netflow_usd: float      # 最新交易日净流入 (USD)，流出为负
+    trade_date: str         # 对应交易日 (YYYY-MM-DD)
+    source: str             # "SoSoValue API" | "Farside Investors" | "Manual Override" | "Unavailable"
+    fetched_at_mono: float  # 缓存时间戳
+
+
+class _FarsideTableParser(HTMLParser):
+    """零依赖标准库 HTML 解析器，专门提取 Farside Investors ETF 流量表格的所有行"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._in_tr = False
+        self._in_cell = False
+        self._cur_cell: List[str] = []
+        self._cur_row: List[str] = []
+        self.rows: List[List[str]] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        t = tag.lower()
+        if t == "tr":
+            self._in_tr = True
+            self._cur_row = []
+        elif t in ("td", "th") and self._in_tr:
+            self._in_cell = True
+            self._cur_cell = []
+
+    def handle_endtag(self, tag: str) -> None:
+        t = tag.lower()
+        if t in ("td", "th") and self._in_cell:
+            self._in_cell = False
+            text = "".join(self._cur_cell).strip()
+            self._cur_row.append(text)
+        elif t == "tr" and self._in_tr:
+            self._in_tr = False
+            if self._cur_row:
+                self.rows.append(self._cur_row)
+
+    def handle_data(self, data: str) -> None:
+        if self._in_cell:
+            self._cur_cell.append(data)
+
+
+class SpotETFFlowParser:
+    """
+    标准化解析 SoSoValue v1 JSON 与 Farside Investors HTML 表格，
+    确保跳过 T+1 未结算空行与汇总尾行，始终返回最新已公布交易日的真实净流入。
+    """
+
+    DATE_PATTERN = re.compile(r"^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$")
+
+    @staticmethod
+    def parse_sosovalue_json(payload: Dict[str, Any]) -> Optional[ETFFlowSnapshot]:
+        if payload.get("code") != 0:
+            return None
+        data = payload.get("data")
+        if not isinstance(data, list) or not data:
+            return None
+
+        # 按 date 降序排序，跳过 T+1 尚未结算 (total_net_inflow 为 None) 的最新空行
+        rows = sorted(
+            [r for r in data if isinstance(r, dict) and r.get("date")],
+            key=lambda r: str(r.get("date")),
+            reverse=True,
+        )
+        for row in rows:
+            val = row.get("total_net_inflow")
+            if val is None or val == "":
+                continue
+            try:
+                flow_usd = float(val)
+            except (TypeError, ValueError):
+                continue
+            return ETFFlowSnapshot(
+                netflow_usd=round(flow_usd, 2),
+                trade_date=str(row["date"])[:10],
+                source="SoSoValue API",
+                fetched_at_mono=time.monotonic(),
+            )
+        return None
+
+    @classmethod
+    def _parse_farside_number_millions(cls, raw: str) -> Optional[float]:
+        s = raw.strip().replace(",", "").replace("$", "")
+        if not s or s in ("-", "—", "N/A", "n/a", "0.0", "0"):
+            return None
+        neg = False
+        if s.startswith("(") and s.endswith(")"):
+            neg = True
+            s = s[1:-1].strip()
+        try:
+            val = float(s)
+        except ValueError:
+            return None
+        return -val if neg else val
+
+    @classmethod
+    def parse_farside_html(cls, html: str) -> Optional[ETFFlowSnapshot]:
+        parser = _FarsideTableParser()
+        parser.feed(html)
+
+        latest: Optional[Tuple[datetime, float]] = None
+        for row in parser.rows:
+            if len(row) < 3:
+                continue
+            date_cell = row[0].strip()
+            if not cls.DATE_PATTERN.match(date_cell):
+                continue
+            try:
+                dt = datetime.strptime(date_cell, "%d %b %Y")
+            except ValueError:
+                continue
+
+            # 最后一列为 Total (单位: US$ millions)
+            total_m = cls._parse_farside_number_millions(row[-1])
+            if total_m is None:
+                continue
+
+            if latest is None or dt > latest[0]:
+                latest = (dt, total_m)
+
+        if latest is None:
+            return None
+
+        dt_best, total_m_best = latest
+        return ETFFlowSnapshot(
+            netflow_usd=round(total_m_best * 1_000_000.0, 2),
+            trade_date=dt_best.strftime("%Y-%m-%d"),
+            source="Farside Investors",
+            fetched_at_mono=time.monotonic(),
+        )
+
+
+class ETFFlowCache:
+    """日频 ETF 数据进程级缓存（默认 30 分钟 TTL），避免每 5 分钟轮询浪费 API 配额"""
+
+    def __init__(self, ttl_sec: float = 1800.0) -> None:
+        self.ttl_sec = ttl_sec
+        self.cached: Optional[ETFFlowSnapshot] = None
+        self.last_error: Optional[str] = None
+
+    def get_fresh(self) -> Optional[ETFFlowSnapshot]:
+        if self.cached is None:
+            return None
+        if (time.monotonic() - self.cached.fetched_at_mono) <= self.ttl_sec:
+            return self.cached
+        return None
+
+    def put(self, snap: ETFFlowSnapshot) -> None:
+        self.cached = snap
+        self.last_error = None
+
+    def clear(self) -> None:
+        self.cached = None
+        self.last_error = None
+
+
+GLOBAL_ETF_CACHE = ETFFlowCache(ttl_sec=1800.0)
+
+
+# =============================================================================
+# 2. Deribit 期权链 Black-Scholes Gamma & GEX 实时计算引擎
 # =============================================================================
 
 @dataclass(frozen=True)
@@ -134,7 +301,6 @@ class DeribitGEXCalculator:
         now_utc: Optional[datetime] = None,
         max_dte_days: float = 14.0,
     ) -> List[Dict[str, Any]]:
-        """生成现价 ±16% 区间内各行权价 Call/Put/Net GEX 柱状图序列 ($M / 1% Move)"""
         now = now_utc or datetime.now(timezone.utc)
         options = [
             p
@@ -271,7 +437,7 @@ class DeribitGEXCalculator:
 
 
 # =============================================================================
-# 2. 美国直连双源容灾路由 (OKX Primary -> Deribit Perpetual Fallback)
+# 3. 美国直连双源容灾路由 (OKX Primary -> Deribit Perpetual Fallback)
 # =============================================================================
 
 @dataclass(frozen=True)
@@ -280,7 +446,7 @@ class NormalizedTechRaw:
     spot_price: float
     low_24h: float
     high_24h: float
-    klines_1h_asc: List[Tuple[int, float, float, float, float, float]]  # (ts, o, h, l, c, vol_btc)
+    klines_1h_asc: List[Tuple[int, float, float, float, float, float]]
     last_1h_close: float
     depth_1pct_usd: float
 
@@ -295,13 +461,6 @@ class NormalizedDerivRaw:
 
 
 class ExchangeFailoverCircuit:
-    """
-    轻量级主源熔断器：
-    默认直连 OKX 公开永续合约 API；若 OKX 出现超时、限频或短时维护，
-    自动切入 15 分钟冷却期，期间无缝切换至 Deribit BTC-PERPETUAL 公开接口，
-    冷却结束后自动重新探测 OKX。
-    """
-
     def __init__(self, cooldown_sec: float = 900.0) -> None:
         self.cooldown_sec = cooldown_sec
         self._primary_blocked_until: float = 0.0
@@ -327,21 +486,25 @@ GLOBAL_EXCHANGE_CIRCUIT = ExchangeFailoverCircuit(cooldown_sec=900.0)
 
 
 # =============================================================================
-# 3. 生产级异步 API 适配器 (美国直连免代理：OKX + Deribit + F&G)
+# 4. 生产级异步 API 适配器 (V4: OKX + Deribit + 自动现货 ETF 净流入抓取)
 # =============================================================================
 
 class ProductionAPIAdapter(BaseMarketDataAdapter):
     """
-    全异步公开接口实盘适配器 (V3 美国直连纯净版)：
-    - 主永续数据源: OKX V5 公开永续合约 (BTC-USDT-SWAP) —— K线、盘口深度、资金费率、1H/24H OI 历史
-    - 故障转移备源: Deribit 公开永续合约 (BTC-PERPETUAL) —— 零新增依赖，OKX 异常时无缝顶上
-    - 期权波动率源: Deribit 公开期权 API (真实 DVOL + 期权链全行权价 GEX / Flip / Call&Put Wall)
-    - 舆情基准源:   Alternative.me 14日恐惧与贪婪指数
+    全异步公开接口实盘适配器 (V4)：
+    - 主永续数据源: OKX V5 (BTC-USDT-SWAP) -> 备源 Deribit (BTC-PERPETUAL)
+    - 期权波动率源: Deribit 公开期权 API (真实 DVOL + 期权链 GEX / Flip / Call&Put Wall)
+    - 现货 ETF 源 : 自动瀑布流抓取 —— 优先 SoSoValue 免费官方 API (配置 SOSO_API_KEY)
+                   -> 零密钥自动解析 Farside Investors 官方日度流量表
+                   -> 支持网页端手动覆盖，留空自动恢复实时抓取
+    - 舆情基准源  : Alternative.me 14日恐惧与贪婪指数
     """
 
     OKX_API = "https://www.okx.com"
     DERIBIT_API = "https://www.deribit.com/api/v2"
     ALT_FNG_API = "https://api.alternative.me/fng/"
+    SOSO_ETF_API = "https://openapi.sosovalue.com/openapi/v1/etfs/summary-history"
+    FARSIDE_ETF_URL = "https://farside.co.uk/btc/"
 
     FAILOVER_HTTP_CODES = {403, 418, 429, 451, 500, 502, 503, 504}
 
@@ -350,13 +513,14 @@ class ProductionAPIAdapter(BaseMarketDataAdapter):
         okx_inst_id: str = "BTC-USDT-SWAP",
         okx_ct_val_btc: float = 0.01,
         deribit_perp: str = "BTC-PERPETUAL",
-        exchange_source: Optional[str] = None,  # "auto" | "okx" | "deribit"
+        exchange_source: Optional[str] = None,
         circuit: Optional[ExchangeFailoverCircuit] = None,
+        etf_cache: Optional[ETFFlowCache] = None,
+        soso_api_key: Optional[str] = None,
         proxy: Optional[str] = None,
         timeout_sec: float = 10.0,
         depth_baseline_usd: float = 28_000_000.0,
-        coinglass_api_key: Optional[str] = None,
-        manual_etf_netflow_usd: float = 0.0,
+        manual_etf_netflow_usd: Optional[float] = None,  # None = 自动抓取；非 None = 手动覆盖
         manual_polymarket_bias: Optional[float] = None,
         manual_events: Optional[List[EventShock]] = None,
     ):
@@ -368,10 +532,11 @@ class ProductionAPIAdapter(BaseMarketDataAdapter):
             self.exchange_source = "auto"
 
         self.circuit = circuit or GLOBAL_EXCHANGE_CIRCUIT
+        self.etf_cache = etf_cache or GLOBAL_ETF_CACHE
+        self.soso_api_key = (soso_api_key or os.getenv("SOSO_API_KEY") or "").strip() or None
         self.proxy = proxy or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
         self.timeout_sec = timeout_sec
         self.depth_baseline_usd = depth_baseline_usd
-        self.coinglass_api_key = coinglass_api_key or os.getenv("COINGLASS_API_KEY")
         self.manual_etf_netflow_usd = manual_etf_netflow_usd
         self.manual_polymarket_bias = manual_polymarket_bias
         self.manual_events = manual_events or []
@@ -380,8 +545,9 @@ class ProductionAPIAdapter(BaseMarketDataAdapter):
         self._cached_spot: Optional[float] = None
         self._cached_24h_range: Tuple[float, float] = (0.0, 0.0)
         self._deribit_book_cache: Optional[Dict[str, Any]] = None
+        self._etf_inflight: Optional[asyncio.Task[ETFFlowSnapshot]] = None
 
-        # 供 Web 看板和日志读取的实时遥测字段
+        # 实时遥测字段
         self.active_exchange: str = "DERIBIT" if self.exchange_source == "deribit" else "OKX"
         self.failover_reason: Optional[str] = self.circuit.last_failover_reason
         self.last_gex_profile: Optional[GEXProfile] = None
@@ -393,13 +559,16 @@ class ProductionAPIAdapter(BaseMarketDataAdapter):
         self.latest_dvol: float = 0.0
         self.latest_avwap: float = 0.0
         self.latest_fng: int = 50
+        self.latest_etf: ETFFlowSnapshot = ETFFlowSnapshot(
+            netflow_usd=0.0, trade_date="--", source="Initializing", fetched_at_mono=0.0
+        )
 
     async def __aenter__(self) -> ProductionAPIAdapter:
         if aiohttp is None:
             raise RuntimeError("请先安装 aiohttp: pip install aiohttp")
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=self.timeout_sec),
-            headers={"User-Agent": "CarbonQuant-BTC24H/3.0"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; CarbonQuant-BTC24H/4.0)"},
         )
         return self
 
@@ -407,24 +576,125 @@ class ProductionAPIAdapter(BaseMarketDataAdapter):
         if self._session and not self._session.closed:
             await self._session.close()
 
+    async def _ensure_session(self) -> Any:
+        if aiohttp is None:
+            raise RuntimeError("请先安装 aiohttp: pip install aiohttp")
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.timeout_sec),
+                headers={"User-Agent": "Mozilla/5.0 (compatible; CarbonQuant-BTC24H/4.0)"},
+            )
+        return self._session
+
     async def _get_json(
         self,
         url: str,
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
     ) -> Any:
-        if aiohttp is None:
-            raise RuntimeError("请先安装 aiohttp: pip install aiohttp")
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.timeout_sec),
-                headers={"User-Agent": "CarbonQuant-BTC24H/3.0"},
-            )
-        async with self._session.get(
-            url, params=params, headers=headers, proxy=self.proxy
-        ) as resp:
+        session = await self._ensure_session()
+        async with session.get(url, params=params, headers=headers, proxy=self.proxy) as resp:
             resp.raise_for_status()
             return await resp.json()
+
+    async def _get_text(
+        self,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> str:
+        session = await self._ensure_session()
+        async with session.get(url, headers=headers, proxy=self.proxy) as resp:
+            resp.raise_for_status()
+            return await resp.text()
+
+    # -------------------------------------------------------------------------
+    # 美国现货 BTC ETF 净流入自动抓取逻辑 (Tier 1 SoSoValue -> Tier 2 Farside)
+    # -------------------------------------------------------------------------
+
+    async def _fetch_spot_etf_netflow(self) -> ETFFlowSnapshot:
+        if self._etf_inflight is None:
+            self._etf_inflight = asyncio.create_task(self._fetch_spot_etf_netflow_impl())
+        return await self._etf_inflight
+
+    async def _fetch_spot_etf_netflow_impl(self) -> ETFFlowSnapshot:
+        # 1) 若用户在网页端显式填入了手动覆盖值，优先采用手动值
+        if self.manual_etf_netflow_usd is not None:
+            snap = ETFFlowSnapshot(
+                netflow_usd=round(self.manual_etf_netflow_usd, 2),
+                trade_date="手动覆盖",
+                source="Manual Override",
+                fetched_at_mono=time.monotonic(),
+            )
+            self.latest_etf = snap
+            return snap
+
+        # 2) 命中 30 分钟进程级缓存直接返回
+        cached = self.etf_cache.get_fresh()
+        if cached is not None:
+            self.latest_etf = cached
+            return cached
+
+        errors: List[str] = []
+
+        # 3) Tier 1: SoSoValue 官方免费 API (需在 .env 填入 SOSO_API_KEY，零反爬风险)
+        if self.soso_api_key:
+            try:
+                payload = await self._get_json(
+                    self.SOSO_ETF_API,
+                    params={"symbol": "BTC", "country_code": "US", "limit": 7},
+                    headers={"x-soso-api-key": self.soso_api_key},
+                )
+                snap = SpotETFFlowParser.parse_sosovalue_json(payload)
+                if snap is not None:
+                    self.etf_cache.put(snap)
+                    self.latest_etf = snap
+                    return snap
+                errors.append("SoSoValue 未返回有效净流入记录")
+            except Exception as exc:
+                errors.append(f"SoSoValue 异常: {type(exc).__name__}")
+
+        # 4) Tier 2: Farside Investors 官方页面零密钥自动解析
+        try:
+            html = await self._get_text(
+                self.FARSIDE_ETF_URL,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/130.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            )
+            snap = SpotETFFlowParser.parse_farside_html(html)
+            if snap is not None:
+                self.etf_cache.put(snap)
+                self.latest_etf = snap
+                return snap
+            errors.append("Farside 页面解析无有效数值")
+        except Exception as exc:
+            errors.append(f"Farside 抓取受限: {type(exc).__name__}")
+
+        # 5) 兜底：若存在过期旧缓存则降级沿用，避免突然归零
+        if self.etf_cache.cached is not None:
+            self.etf_cache.last_error = "; ".join(errors)
+            self.latest_etf = self.etf_cache.cached
+            return self.etf_cache.cached
+
+        self.etf_cache.last_error = "; ".join(errors) or "未获取到 ETF 数据"
+        fallback = ETFFlowSnapshot(
+            netflow_usd=0.0,
+            trade_date="--",
+            source="Auto Failed (建议配置免费 SOSO_API_KEY)",
+            fetched_at_mono=time.monotonic(),
+        )
+        self.latest_etf = fallback
+        return fallback
+
+    # -------------------------------------------------------------------------
+    # OKX & Deribit 永续合约抓取与路由
+    # -------------------------------------------------------------------------
 
     @classmethod
     def _classify_failover_error(cls, exc: Exception) -> Optional[str]:
@@ -446,10 +716,6 @@ class ProductionAPIAdapter(BaseMarketDataAdapter):
     def _calc_anchored_vwap(
         klines_asc: List[Tuple[int, float, float, float, float, float]]
     ) -> float:
-        """
-        输入统一为时间升序 [(ts, o, h, l, c, vol_btc), ...]
-        锚定在过去 48H 成交量最大（大清算扫荡）的那根 1H K 线向后计算 AVWAP
-        """
         if not klines_asc:
             return 0.0
         anchor_idx = max(range(len(klines_asc)), key=lambda i: klines_asc[i][5])
@@ -469,7 +735,6 @@ class ProductionAPIAdapter(BaseMarketDataAdapter):
         spot: float,
         ct_val_btc: float,
     ) -> float:
-        """OKX BTC-USDT-SWAP 单张面值 0.01 BTC，计算 ±1% 挂单总美元深度"""
         lower_bound = spot * 0.99
         upper_bound = spot * 1.01
         bid_usd = sum(
@@ -490,16 +755,11 @@ class ProductionAPIAdapter(BaseMarketDataAdapter):
         asks: List[List[Any]],
         spot: float,
     ) -> float:
-        """Deribit BTC-PERPETUAL 反向合约盘口数量 amount 本身以 USD 计价"""
         lower_bound = spot * 0.99
         upper_bound = spot * 1.01
         bid_usd = sum(float(row[1]) for row in bids if float(row[0]) >= lower_bound)
         ask_usd = sum(float(row[1]) for row in asks if float(row[0]) <= upper_bound)
         return bid_usd + ask_usd
-
-    # -------------------------------------------------------------------------
-    # 主数据源: OKX V5 公开永续合约 (BTC-USDT-SWAP)
-    # -------------------------------------------------------------------------
 
     @staticmethod
     def _unwrap_okx_data(payload: Dict[str, Any], endpoint_name: str) -> List[Any]:
@@ -536,7 +796,6 @@ class ProductionAPIAdapter(BaseMarketDataAdapter):
         low_24h = float(ticker["low24h"])
         high_24h = float(ticker["high24h"])
 
-        # OKX candles 为倒序，优先取 confirm == "1" 的最新已收盘 1H K 线
         last_1h_close = spot
         for row in candles_desc:
             if len(row) >= 9 and str(row[8]) == "1":
@@ -624,10 +883,6 @@ class ProductionAPIAdapter(BaseMarketDataAdapter):
             oi_change_1h_pct=oi_change_1h,
         )
 
-    # -------------------------------------------------------------------------
-    # 故障转移备源: Deribit 公开永续合约 (BTC-PERPETUAL)
-    # -------------------------------------------------------------------------
-
     async def _fetch_deribit_perp_book(self) -> Dict[str, Any]:
         if self._deribit_book_cache is not None:
             return self._deribit_book_cache
@@ -697,7 +952,6 @@ class ProductionAPIAdapter(BaseMarketDataAdapter):
         book = await self._fetch_deribit_perp_book()
         mark_price = float(book.get("mark_price") or book.get("last_price") or 0.0)
         funding_8h = float(book.get("funding_8h") or 0.0)
-        # Deribit 公开免费接口不提供小时级历史 OI 序列，备用模式安全置 0.0（不影响磁吸带计算）
         return NormalizedDerivRaw(
             exchange="DERIBIT",
             mark_price=mark_price,
@@ -705,10 +959,6 @@ class ProductionAPIAdapter(BaseMarketDataAdapter):
             oi_change_24h_pct=0.0,
             oi_change_1h_pct=0.0,
         )
-
-    # -------------------------------------------------------------------------
-    # 双源路由执行层 (OKX Primary -> Deribit Fallback)
-    # -------------------------------------------------------------------------
 
     async def _route_exchange_technical(self) -> NormalizedTechRaw:
         if self.exchange_source == "deribit":
@@ -774,7 +1024,10 @@ class ProductionAPIAdapter(BaseMarketDataAdapter):
     # -------------------------------------------------------------------------
 
     async def fetch_technical(self) -> TechnicalSnapshot:
-        raw = await self._route_exchange_technical()
+        raw, etf_snap = await asyncio.gather(
+            self._route_exchange_technical(),
+            self._fetch_spot_etf_netflow(),
+        )
         self._cached_spot = raw.spot_price
         self._cached_24h_range = (raw.low_24h, raw.high_24h)
         self.last_1h_close = raw.last_1h_close
@@ -788,7 +1041,7 @@ class ProductionAPIAdapter(BaseMarketDataAdapter):
             avwap_anchor=avwap,
             recent_24h_low=raw.low_24h,
             recent_24h_high=raw.high_24h,
-            spot_etf_netflow_usd=self.manual_etf_netflow_usd,
+            spot_etf_netflow_usd=etf_snap.netflow_usd,
             orderbook_depth_ratio=depth_ratio,
             timestamp=datetime.now(timezone.utc),
         )
@@ -817,9 +1070,6 @@ class ProductionAPIAdapter(BaseMarketDataAdapter):
         dvol: float,
         funding_rate: float,
     ) -> Tuple[float, float, float]:
-        if self.coinglass_api_key:
-            pass
-
         em_1d = spot * (dvol / math.sqrt(365.0))
         low_24h, high_24h = self._cached_24h_range
 
@@ -910,11 +1160,26 @@ class ProductionAPIAdapter(BaseMarketDataAdapter):
             else round((latest_fng - 50.0) / 50.0 * 0.6, 3)
         )
 
+        # 复用单次并发 ETF 抓取结果，消除冷启动竞态，并将 ±$100M 以上流向自动映射为事件冲击因子
+        etf_snap = await self._fetch_spot_etf_netflow()
+        events = list(self.manual_events)
+        if not events and abs(etf_snap.netflow_usd) >= 100_000_000.0:
+            etf_m = etf_snap.netflow_usd / 1_000_000.0
+            etf_score = max(-0.85, min(0.85, etf_m / 300.0))
+            events.append(
+                EventShock(
+                    title=f"US Spot BTC ETF ({etf_snap.trade_date}) {etf_m:+.1f}M",
+                    score=round(etf_score, 3),
+                    hours_ago=3.0,
+                    half_life_hours=4.0,
+                )
+            )
+
         return SentimentSnapshot(
             polymarket_bias=poly_bias,
             social_zscore_24h=z_score,
             fear_greed_index=latest_fng,
-            events=self.manual_events,
+            events=events,
         )
 
 
@@ -924,14 +1189,14 @@ async def run_live() -> None:
         deribit_perp="BTC-PERPETUAL",
         exchange_source=os.getenv("EXCHANGE_SOURCE", "auto"),
         proxy=os.getenv("HTTPS_PROXY"),
-        manual_etf_netflow_usd=0.0,
     ) as adapter:
         pipeline = BTC24HPredictorPipeline(adapter=adapter)
         result = await pipeline.run_once()
         gex = adapter.last_gex_profile
+        etf = adapter.latest_etf
         print("=" * 76)
-        print(f"BTC 24H 实时预测系统 [LIVE] | UTC: {result.timestamp}")
-        print(f"永续合约源: {adapter.active_exchange} | 路由状态: {adapter.failover_reason or 'OKX 主源正常'}")
+        print(f"BTC 24H 实时预测系统 [LIVE V4] | UTC: {result.timestamp}")
+        print(f"永续源: {adapter.active_exchange} | 现货 ETF: {etf.netflow_usd/1e6:+.1f}M ({etf.trade_date} · {etf.source})")
         print(f"现价: ${result.spot_price:,.1f} | EM: ±${result.em_24h:,.1f} | 1H收盘: ${adapter.last_1h_close:,.1f}")
         if gex:
             print(

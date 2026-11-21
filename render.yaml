@@ -16,3 +16,4 @@ services:
         value: "0"
       - key: EXCHANGE_SOURCE
         value: "auto"
+      # 可在 Render 控制台 Environment 里添加 SOSO_API_KEY 获得最稳定的官方 ETF JSON 接口

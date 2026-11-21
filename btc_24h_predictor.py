@@ -97,11 +97,11 @@ class PredictionOutput:
 # =============================================================================
 
 class BaseMarketDataAdapter(ABC):
-    """统一数据源抽象接口：实盘挂载 OKX / Deribit 异步公开接口"""
+    """统一数据源抽象接口：实盘挂载 OKX / Deribit / SoSoValue / Farside 异步公开接口"""
 
     @abstractmethod
     async def fetch_technical(self) -> TechnicalSnapshot:
-        """对接 OKX / Deribit 永续合约 K 线、深度盘口及 ETF 净流入数据"""
+        """对接 OKX / Deribit 永续合约 K 线、深度盘口及自动抓取的美国现货 ETF 净流入"""
         raise NotImplementedError
 
     @abstractmethod

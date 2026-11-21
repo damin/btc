@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "============================================================"
-echo "  BTC 24H 极值磁吸带 & Deribit GEX 监控看板 (V3 美国直连版)"
+echo "  BTC 24H 极值磁吸带 & Deribit GEX 监控看板 (V4 全自动ETF版)"
 echo "============================================================"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
