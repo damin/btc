@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import math
 import os
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +47,8 @@ def _load_local_dotenv() -> None:
 _load_local_dotenv()
 
 REFRESH_INTERVAL_SEC = int(os.getenv("REFRESH_INTERVAL_SEC", "300"))
+# 2026-11-22 18:00:00 EST (UTC-5) 对应的毫秒时间戳，用于拉取完整对比窗口历史 K 线
+LOCKED_FORECAST_START_MS = 1795388400000
 
 
 # =============================================================================
@@ -76,6 +82,110 @@ def _demo_strike_gex_bars() -> List[Dict[str, Any]]:
         }
         for k, c, p in sample
     ]
+
+
+def _build_demo_candles(start_ms: int) -> List[Dict[str, float]]:
+    """DEMO 沙盘模式下生成平滑演示 15m K 线，便于离线预览预测 vs 实盘对比效果"""
+    waypoints = [
+        (0.0, 61248.2), (1.5, 61020.0), (4.0, 61510.0), (6.5, 61480.0),
+        (9.0, 62890.0), (11.5, 63320.0), (13.5, 61840.0), (16.0, 59820.0),
+        (18.5, 58590.0), (20.5, 58910.0),
+    ]
+    bars: List[Dict[str, float]] = []
+    prev_c = 61248.2
+    for step in range(82):  # 约 20.5 小时 (82 根 15m K线)
+        h = step * 0.25
+        ts = start_ms + step * 15 * 60 * 1000
+        base = waypoints[-1][1]
+        for i in range(len(waypoints) - 1):
+            h0, p0 = waypoints[i]
+            h1, p1 = waypoints[i + 1]
+            if h0 <= h <= h1:
+                t = (h - h0) / (h1 - h0)
+                mu = (1.0 - math.cos(t * math.pi)) / 2.0
+                base = p0 * (1.0 - mu) + p1 * mu
+                break
+        wave = math.sin(step * 0.85) * 145.0 + math.cos(step * 0.37) * 80.0
+        close_p = round(base + wave, 1)
+        open_p = prev_c
+        high_p = round(max(open_p, close_p) + abs(math.sin(step * 1.3)) * 210.0 + 45.0, 1)
+        low_p = round(min(open_p, close_p) - abs(math.cos(step * 1.1)) * 220.0 - 45.0, 1)
+        vol = round(180.0 + abs(close_p - open_p) * 1.35 + (420.0 if 13.0 <= h <= 18.0 else 60.0), 1)
+        bars.append({"ts": ts, "o": open_p, "h": high_p, "l": low_p, "c": close_p, "v": vol})
+        prev_c = close_p
+    return bars
+
+
+def _http_get_json(url: str, proxy: Optional[str], timeout: float = 8.0) -> Any:
+    handlers = []
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    opener = urllib.request.build_opener(*handlers)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "BTC-24H-GEX-Dashboard/4.1",
+            "Accept": "application/json",
+        },
+    )
+    with opener.open(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _fetch_okx_15m_candles(proxy: Optional[str], limit: int = 240) -> List[Dict[str, float]]:
+    url = f"https://www.okx.com/api/v5/market/candles?instId=BTC-USDT-SWAP&bar=15m&limit={limit}"
+    payload = _http_get_json(url, proxy=proxy)
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not rows:
+        raise RuntimeError(f"OKX candles empty: {payload}")
+    candles = [
+        {
+            "ts": int(r[0]),
+            "o": float(r[1]),
+            "h": float(r[2]),
+            "l": float(r[3]),
+            "c": float(r[4]),
+            "v": float(r[5]),
+        }
+        for r in rows
+    ]
+    candles.sort(key=lambda x: x["ts"])
+    return candles
+
+
+def _fetch_deribit_15m_candles(
+    proxy: Optional[str],
+    start_ms: int,
+    end_ms: int,
+) -> List[Dict[str, float]]:
+    url = (
+        "https://www.deribit.com/api/v2/public/get_tradingview_chart_data"
+        f"?instrument_name=BTC-PERPETUAL&start_timestamp={start_ms}&end_timestamp={end_ms}&resolution=15"
+    )
+    payload = _http_get_json(url, proxy=proxy)
+    res = payload.get("result") if isinstance(payload, dict) else None
+    if not res or res.get("status") != "ok" or not res.get("ticks"):
+        raise RuntimeError(f"Deribit chart data invalid: {payload}")
+    candles = [
+        {
+            "ts": int(ts),
+            "o": float(o),
+            "h": float(h),
+            "l": float(l),
+            "c": float(c),
+            "v": float(v or 0.0),
+        }
+        for ts, o, h, l, c, v in zip(
+            res["ticks"],
+            res["open"],
+            res["high"],
+            res["low"],
+            res["close"],
+            res.get("volume", [0.0] * len(res["ticks"])),
+        )
+    ]
+    candles.sort(key=lambda x: x["ts"])
+    return candles
 
 
 def _evaluate_alert_state(
@@ -128,6 +238,7 @@ def _evaluate_alert_state(
 class DashboardStateStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._candle_lock = threading.Lock()
         self._refreshing = False
         self.mode: str = "DEMO" if os.getenv("USE_DEMO", "0") == "1" else "LIVE"
         self.exchange_source: str = os.getenv("EXCHANGE_SOURCE", "auto").strip().lower()
@@ -142,6 +253,92 @@ class DashboardStateStore:
         self.last_error: Optional[str] = None
         self.last_updated_epoch: float = 0.0
         self.next_refresh_epoch: float = time.time() + REFRESH_INTERVAL_SEC
+
+        # 15m K 线短期缓存（避免前端频繁刷新触发交易所限频）
+        self._candle_cache_payload: Optional[Dict[str, Any]] = None
+        self._candle_cache_epoch: float = 0.0
+
+    def invalidate_candle_cache(self) -> None:
+        with self._candle_lock:
+            self._candle_cache_payload = None
+            self._candle_cache_epoch = 0.0
+
+    def get_candles_json(self, start_ms: Optional[int] = None) -> Dict[str, Any]:
+        now_ep = time.time()
+        with self._lock:
+            mode = self.mode
+            exchange_source = self.exchange_source
+            proxy = self.proxy
+            snap = self.snapshot
+            snap_ep = self.last_updated_epoch
+
+        if mode == "DEMO":
+            base_start = start_ms or LOCKED_FORECAST_START_MS
+            return {
+                "ok": True,
+                "source": "DEMO_SNAPSHOT",
+                "candles": _build_demo_candles(base_start),
+            }
+
+        with self._candle_lock:
+            if (
+                self._candle_cache_payload is not None
+                and (now_ep - self._candle_cache_epoch) < 45.0
+                and start_ms is None
+            ):
+                return self._candle_cache_payload
+
+        now_ms = int(now_ep * 1000)
+        query_start_ms = min(start_ms or LOCKED_FORECAST_START_MS, now_ms - 48 * 3600 * 1000)
+
+        candles: List[Dict[str, float]] = []
+        used_source = "OKX"
+        err_notes: List[str] = []
+
+        order = ["deribit", "okx"] if exchange_source == "deribit" else ["okx", "deribit"]
+        if exchange_source == "auto" and GLOBAL_EXCHANGE_CIRCUIT.remaining_cooldown_sec > 0:
+            order = ["deribit", "okx"]
+
+        for src in order:
+            try:
+                if src == "okx":
+                    candles = _fetch_okx_15m_candles(proxy=proxy, limit=240)
+                    used_source = "OKX (BTC-USDT-SWAP)"
+                else:
+                    candles = _fetch_deribit_15m_candles(
+                        proxy=proxy,
+                        start_ms=query_start_ms,
+                        end_ms=now_ms,
+                    )
+                    used_source = "DERIBIT (BTC-PERPETUAL)"
+                if candles:
+                    break
+            except Exception as exc:
+                err_notes.append(f"{src.upper()}: {exc}")
+
+        # 用快照最新现价修正最后一根 K 线收盘价，确保与顶部 KPI 现价完全一致
+        if candles and snap and snap.get("prediction") and snap_ep > 0:
+            spot_now = float(snap["prediction"]["spot_price"])
+            snap_ms = int(snap_ep * 1000)
+            last_bar = candles[-1]
+            if snap_ms >= last_bar["ts"]:
+                last_bar["c"] = spot_now
+                last_bar["h"] = max(last_bar["h"], spot_now)
+                last_bar["l"] = min(last_bar["l"], spot_now)
+
+        result = {
+            "ok": len(candles) > 0,
+            "source": used_source if candles else "UNAVAILABLE",
+            "candles": candles,
+            "error": " | ".join(err_notes) if not candles and err_notes else None,
+        }
+
+        if candles and start_ms is None:
+            with self._candle_lock:
+                self._candle_cache_payload = result
+                self._candle_cache_epoch = now_ep
+
+        return result
 
     async def _fetch_payload_async(
         self,
@@ -262,6 +459,7 @@ class DashboardStateStore:
                 self.last_error = None
                 self.last_updated_epoch = now_ep
                 self.next_refresh_epoch = now_ep + REFRESH_INTERVAL_SEC
+            self.invalidate_candle_cache()
             return True, None
         except Exception as exc:
             err_msg = f"{type(exc).__name__}: {exc}"
@@ -293,6 +491,7 @@ class DashboardStateStore:
             if polymarket_bias is not None:
                 text = str(polymarket_bias).strip()
                 self.manual_polymarket_bias = None if text == "" else max(-1.0, min(1.0, float(text)))
+        self.invalidate_candle_cache()
 
     def get_state_json(self) -> Dict[str, Any]:
         with self._lock:
@@ -369,6 +568,14 @@ def api_snapshot():
     return jsonify(store.get_state_json())
 
 
+@app.route("/api/candles", methods=["GET"])
+def api_candles():
+    ensure_poller_started()
+    start_arg = request.args.get("start_ms", "").strip()
+    start_ms = int(start_arg) if start_arg.isdigit() else None
+    return jsonify(store.get_candles_json(start_ms=start_ms))
+
+
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
     ok, err = store.refresh_now(force_etf_refresh=True)
@@ -397,7 +604,7 @@ def api_config():
 
 
 # =============================================================================
-# 3. 内嵌暗色量化终端前端 (V4: 自动 ETF 净流入遥测 + 留空自动恢复)
+# 3. 内嵌暗色量化终端前端 (V4.1: 集成 24H 预测路径 vs 实时行情同图对比)
 # =============================================================================
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -405,7 +612,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>BTC 24H 极值磁吸带 & Deribit GEX 实时看板 (V4)</title>
+  <title>BTC 24H 极值磁吸带 & Deribit GEX 实时看板 (V4.1)</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
   <style>
     :root {
@@ -451,6 +658,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
     button:hover { opacity: 0.9; }
     button.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+    button.secondary.active { border-color: var(--blue); color: var(--blue); background: rgba(56,189,248,0.12); }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     .info-bar {
       display: none; background: rgba(56,189,248,0.12); border: 1px solid rgba(56,189,248,0.45);
@@ -488,7 +696,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     @media (max-width: 1040px) { .main-grid { grid-template-columns: 1fr; } }
     .panel-header {
       display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;
-      border-bottom: 1px solid var(--border); padding-bottom: 10px;
+      border-bottom: 1px solid var(--border); padding-bottom: 10px; flex-wrap: wrap; gap: 10px;
     }
     .panel-title { font-size: 14.5px; font-weight: 700; }
     .panel-meta { font-size: 12px; color: var(--muted); }
@@ -522,6 +730,36 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .line-inv { border-top: 1.5px solid var(--red); z-index: 7; justify-content: flex-start; }
     .line-inv .price-tag { background: rgba(244,63,94,0.85); color: #fff; margin-left: 10px; font-size: 11px; }
     .chart-box { position: relative; height: 420px; width: 100%; }
+
+    /* ====== 预测 vs 实时行情同图对比样式 ====== */
+    .compare-toolbar {
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+      gap: 10px; margin-bottom: 10px;
+    }
+    .compare-metrics { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .cmp-stat {
+      background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+      padding: 5px 11px; font-size: 12px;
+    }
+    .cmp-stat span { color: var(--muted); margin-right: 6px; }
+    .compare-legend {
+      display: flex; flex-wrap: wrap; gap: 16px; font-size: 12px; color: var(--muted);
+    }
+    .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+    .legend-swatch { width: 20px; height: 0; display: inline-block; }
+    .compare-canvas-wrap {
+      position: relative; height: 430px; width: 100%; background: #0d1320;
+      border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+    }
+    @media (max-width: 768px) { .compare-canvas-wrap { height: 340px; } }
+    #forecastCompareCanvas { width: 100%; height: 100%; display: block; cursor: crosshair; }
+    .compare-tooltip {
+      position: absolute; display: none; pointer-events: none; z-index: 20;
+      background: rgba(13, 19, 32, 0.95); border: 1px solid #334155; border-radius: 8px;
+      padding: 8px 11px; font-size: 12px; line-height: 1.55; color: var(--text);
+      box-shadow: 0 8px 22px rgba(0,0,0,0.5); white-space: nowrap;
+    }
+
     .footer-grid { display: grid; grid-template-columns: 1.15fr 1fr; gap: 16px; }
     @media (max-width: 900px) { .footer-grid { grid-template-columns: 1fr; } }
     .form-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
@@ -539,7 +777,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="container">
     <div class="topbar">
       <div class="brand">
-        <h1>BTC 24H 极值磁吸带 &amp; Deribit GEX 监控终端</h1>
+        <h1>BTC 24H 极值磁吸带 & Deribit GEX 监控终端</h1>
         <div class="sub mono">最后更新: <span id="lastUpdated">--</span> · 下次 5 分钟自动刷新: <span id="countdown">--</span>s</div>
       </div>
       <div class="controls">
@@ -587,9 +825,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="kpi-sub mono" id="kpiEtfMeta">日期: -- | 来源: --</div>
       </div>
       <div class="card">
-        <div class="kpi-label">舆情反身性得分 &amp; 资金费率</div>
+        <div class="kpi-label">舆情反身性得分 & 资金费率</div>
         <div class="kpi-val mono" id="kpiSent">--</div>
-        <div class="kpi-sub mono" id="kpiFund">费率: -- | F&amp;G: --</div>
+        <div class="kpi-sub mono" id="kpiFund">费率: -- | F&G: --</div>
       </div>
     </div>
 
@@ -613,10 +851,56 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- ====== 新增：24H 模拟预测走势 vs 实时行情同图对比模块 ====== -->
+    <div class="card">
+      <div class="panel-header">
+        <div>
+          <div class="panel-title">BTC 24H 极值磁吸带预测路径 vs 实时行情追踪对比</div>
+          <div class="panel-meta mono" id="compareWindowMeta">
+            窗口: 2026-11-22 18:00 ~ 2026-11-23 24:00 (EST) · K线源: 初始化中...
+          </div>
+        </div>
+        <div class="controls">
+          <button id="btnBandLocked" class="secondary active" onclick="setBandMode('locked')">锁定快照磁吸带</button>
+          <button id="btnBandLive" class="secondary" onclick="setBandMode('live')">叠加实时磁吸带</button>
+          <button id="btnReanchor" class="secondary" onclick="reanchorFromCurrentState()">按当前盘面重锚24H</button>
+          <button id="btnResetScript" class="secondary" style="display:none;" onclick="resetToBaselineScript()">恢复初始剧本</button>
+        </div>
+      </div>
+
+      <div class="compare-toolbar">
+        <div class="compare-metrics mono">
+          <div class="cmp-stat"><span>实时现价:</span><strong id="cmpLiveSpot" style="color:var(--blue)">--</strong></div>
+          <div class="cmp-stat"><span>同期预测点位:</span><strong id="cmpPredSpot">--</strong></div>
+          <div class="cmp-stat"><span>路径偏离度:</span><strong id="cmpDelta">--</strong></div>
+          <div class="cmp-stat"><span>剧本验证状态:</span><strong id="cmpStatus">--</strong></div>
+        </div>
+        <div class="compare-legend">
+          <span class="legend-item">
+            <i class="legend-swatch" style="border-top:2px dashed rgba(226,232,240,0.85);"></i> 模拟预测走势 (Forecast)
+          </span>
+          <span class="legend-item">
+            <i class="legend-swatch" style="border-top:2.5px solid #38bdf8;"></i> 实时收盘轨迹 + 15m 影线包络 (Live)
+          </span>
+          <span class="legend-item">
+            <i class="legend-swatch" style="border-top:1.5px dashed #a78bfa;"></i> Gamma Flip
+          </span>
+          <span class="legend-item">
+            <i class="legend-swatch" style="border-top:1.5px dashed #f59e0b;"></i> AVWAP
+          </span>
+        </div>
+      </div>
+
+      <div class="compare-canvas-wrap">
+        <canvas id="forecastCompareCanvas"></canvas>
+        <div id="compareTooltip" class="compare-tooltip mono"></div>
+      </div>
+    </div>
+
     <div class="footer-grid">
       <div class="card">
         <div class="panel-header">
-          <div class="panel-title">数据源路由 &amp; 可选手动覆盖</div>
+          <div class="panel-title">数据源路由 & 可选手动覆盖</div>
           <div class="panel-meta">现货 ETF 已启用自动抓取 · 下方输入框留空即保持全自动</div>
         </div>
         <div class="form-row">
@@ -656,9 +940,579 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   let gexChart = null;
   let currentMode = "LIVE";
   let countdownSec = 300;
+  let latestSnapshotData = null;
 
   const fmtUSD = (v) => (v == null || isNaN(v)) ? "--" : "$" + Number(v).toLocaleString("en-US", { maximumFractionDigits: 1 });
 
+  // =========================================================================
+  // 24H 预测路径 vs 实时行情同图对比引擎
+  // =========================================================================
+  const BASELINE_SCRIPT = {
+    isCustomReanchor: false,
+    windowLabel: "2026-11-22 18:00 ~ 2026-11-23 24:00 (EST)",
+    startTs: Date.parse("2026-11-22T18:00:00-05:00"),
+    endTs: Date.parse("2026-11-24T00:00:00-05:00"),
+    levels: {
+      cbUp: 65774.7,
+      wickCeil: [64818.0, 65447.5],
+      coreHigh: [62885.3, 63602.7],
+      flip: 61248.9,
+      avwap: 59527.0,
+      coreLow: [58057.3, 58774.8],
+      wickFloor: [56317.4, 56945.2],
+      cbDown: 56035.8,
+    },
+    waypoints: [
+      [0.0,  61248.2], [1.5,  60910.0], [4.0,  61420.0], [5.5,  61320.0],
+      [8.0,  62350.0], [9.5,  63060.0], [10.5, 62960.0], [12.0, 63180.0],
+      [14.0, 61080.0], [15.0, 60850.0], [16.3, 59280.0], [18.0, 58260.0],
+      [19.2, 58560.0], [20.2, 58190.0], [21.6, 58740.0], [23.6, 58290.0],
+      [26.5, 58840.0], [28.0, 59080.0], [30.0, 59680.0],
+    ],
+    annotations: [
+      { h: 7.2,  price: 63920, text: "① 今晚~周一晨: 站稳 Flip 激发负 Gamma 助推，冲高测试 Core High" },
+      { h: 16.2, price: 60450, text: "② 周一美盘: 多头踩踏 & ETF 承压，回踩 Core Low 寻底" },
+      { h: 22.8, price: 57560, text: "③ 周一晚: Core Low 企稳，回归中枢震荡" },
+    ],
+  };
+
+  let activeScript = JSON.parse(JSON.stringify(BASELINE_SCRIPT));
+  let bandMode = "locked"; // "locked" | "live"
+  let candleSeries = [];   // [{ ts, o, h, l, c, v }]
+  let candleSourceLabel = "初始化中...";
+  let compareHoverX = null;
+  let liveWs = null;
+
+  function getActiveLevels() {
+    if (bandMode === "live" && latestSnapshotData && latestSnapshotData.prediction) {
+      const p = latestSnapshotData.prediction;
+      const m = latestSnapshotData.market_meta || {};
+      return {
+        cbUp: p.invalidation_bull_trigger,
+        wickCeil: p.wick_ceiling_zone,
+        coreHigh: p.core_high_zone,
+        flip: m.gamma_flip || p.spot_price,
+        avwap: m.avwap || p.spot_price,
+        coreLow: p.core_low_zone,
+        wickFloor: p.wick_floor_zone,
+        cbDown: p.invalidation_bear_trigger,
+      };
+    }
+    return activeScript.levels;
+  }
+
+  function interpolateForecast(ts) {
+    const pts = activeScript.waypoints.map(([h, p]) => ({
+      ts: activeScript.startTs + h * 3600 * 1000,
+      price: p,
+    }));
+    if (ts <= pts[0].ts) return pts[0].price;
+    const last = pts[pts.length - 1];
+    if (ts >= last.ts) return last.price;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const a = pts[i], b = pts[i + 1];
+      if (ts >= a.ts && ts <= b.ts) {
+        const t = (ts - a.ts) / (b.ts - a.ts);
+        const mu = (1 - Math.cos(t * Math.PI)) / 2;
+        return a.price * (1 - mu) + b.price * mu;
+      }
+    }
+    return last.price;
+  }
+
+  function setBandMode(mode) {
+    bandMode = mode;
+    document.getElementById("btnBandLocked").classList.toggle("active", mode === "locked");
+    document.getElementById("btnBandLive").classList.toggle("active", mode === "live");
+    renderComparisonChart();
+  }
+
+  function reanchorFromCurrentState() {
+    if (!latestSnapshotData || !latestSnapshotData.prediction) return;
+    const p = latestSnapshotData.prediction;
+    const m = latestSnapshotData.market_meta || {};
+    const nowMs = Date.now();
+    const spot = p.spot_price;
+    const flip = m.gamma_flip || spot;
+    const avwap = m.avwap || spot;
+    const coreHMid = (p.core_high_zone[0] + p.core_high_zone[1]) / 2;
+    const coreLMid = (p.core_low_zone[0] + p.core_low_zone[1]) / 2;
+    const bullBias = spot >= flip;
+
+    activeScript = {
+      isCustomReanchor: true,
+      windowLabel: "动态重锚窗口: 当前时刻 → 未来 24H",
+      startTs: nowMs - 2 * 3600 * 1000, // 保留前 2 小时实盘衔接
+      endTs: nowMs + 24 * 3600 * 1000,
+      levels: {
+        cbUp: p.invalidation_bull_trigger,
+        wickCeil: [...p.wick_ceiling_zone],
+        coreHigh: [...p.core_high_zone],
+        flip,
+        avwap,
+        coreLow: [...p.core_low_zone],
+        wickFloor: [...p.wick_floor_zone],
+        cbDown: p.invalidation_bear_trigger,
+      },
+      waypoints: bullBias
+        ? [
+            [0.0, spot], [2.0, spot], [5.5, (spot + coreHMid) / 2], [9.0, coreHMid],
+            [13.5, avwap], [18.0, coreLMid + (avwap - coreLMid) * 0.25], [22.0, avwap], [26.0, (avwap + flip) / 2],
+          ]
+        : [
+            [0.0, spot], [2.0, spot], [6.0, (spot + coreLMid) / 2], [10.0, coreLMid],
+            [14.5, avwap], [19.5, (avwap + coreHMid) / 2], [23.0, flip], [26.0, avwap],
+          ],
+      annotations: [],
+    };
+    document.getElementById("btnResetScript").style.display = "inline-block";
+    fetchCandles();
+  }
+
+  function resetToBaselineScript() {
+    activeScript = JSON.parse(JSON.stringify(BASELINE_SCRIPT));
+    document.getElementById("btnResetScript").style.display = "none";
+    fetchCandles();
+  }
+
+  function updateCompareMetaAndMetrics() {
+    document.getElementById("compareWindowMeta").textContent =
+      `窗口: ${activeScript.windowLabel} · K线源: ${candleSourceLabel}`;
+
+    const liveSpot = (candleSeries.length ? candleSeries[candleSeries.length - 1].c : null)
+      ?? (latestSnapshotData?.prediction?.spot_price ?? null);
+    if (liveSpot == null) return;
+
+    const latestTs = candleSeries.length ? candleSeries[candleSeries.length - 1].ts : Date.now();
+    const clampedTs = Math.min(Math.max(latestTs, activeScript.startTs), activeScript.endTs);
+    const predSpot = interpolateForecast(clampedTs);
+    const diff = liveSpot - predSpot;
+    const diffPct = (diff / predSpot) * 100;
+    const lv = getActiveLevels();
+
+    document.getElementById("cmpLiveSpot").textContent = fmtUSD(liveSpot);
+    document.getElementById("cmpPredSpot").textContent = fmtUSD(predSpot);
+
+    const deltaEl = document.getElementById("cmpDelta");
+    const sign = diff >= 0 ? "+" : "-";
+    deltaEl.textContent = `${sign}$${Math.abs(diff).toFixed(1)} (${diff >= 0 ? "+" : ""}${diffPct.toFixed(2)}%)`;
+    deltaEl.style.color = diff >= 0 ? "var(--green)" : "var(--red)";
+
+    const statusEl = document.getElementById("cmpStatus");
+    if (liveSpot >= lv.cbUp || liveSpot <= lv.cbDown) {
+      statusEl.textContent = "触发熔断警戒";
+      statusEl.style.color = "var(--red)";
+    } else if (Math.abs(diffPct) <= 1.5) {
+      statusEl.textContent = "吻合预测通道";
+      statusEl.style.color = "var(--green)";
+    } else if (diff > 0) {
+      statusEl.textContent = "强于预测基准 (偏多运行)";
+      statusEl.style.color = "var(--blue)";
+    } else {
+      statusEl.textContent = "弱于预测基准 (回踩承压)";
+      statusEl.style.color = "var(--amber)";
+    }
+  }
+
+  function renderComparisonChart() {
+    const canvas = document.getElementById("forecastCompareCanvas");
+    const tooltip = document.getElementById("compareTooltip");
+    if (!canvas) return;
+    const wrap = canvas.parentElement;
+    const rect = wrap.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const W = rect.width;
+    const H = rect.height;
+    const pad = { top: 18, right: 68, bottom: 36, left: 14 };
+    const plotW = W - pad.left - pad.right;
+    const plotH = H - pad.top - pad.bottom;
+
+    const lv = getActiveLevels();
+    const startTs = activeScript.startTs;
+    const endTs = activeScript.endTs;
+
+    const visibleCandles = candleSeries.filter(
+      (c) => c.ts >= startTs - 15 * 60 * 1000 && c.ts <= endTs + 15 * 60 * 1000
+    );
+
+    const allPrices = [
+      lv.cbUp, lv.cbDown, lv.wickCeil[1], lv.wickFloor[0],
+      ...activeScript.waypoints.map((w) => w[1]),
+      ...visibleCandles.flatMap((c) => [c.h, c.l]),
+    ].filter((v) => typeof v === "number" && !isNaN(v));
+
+    const minP = Math.min(...allPrices) - 450;
+    const maxP = Math.max(...allPrices) + 450;
+
+    const xOf = (ts) => pad.left + ((ts - startTs) / (endTs - startTs)) * plotW;
+    const yOf = (p) => pad.top + ((maxP - p) / (maxP - minP)) * plotH;
+
+    ctx.clearRect(0, 0, W, H);
+
+    // 1. 绘制磁吸带区间色块
+    const drawZone = (range, fill, border, label) => {
+      const yTop = yOf(range[1]);
+      const yBot = yOf(range[0]);
+      ctx.fillStyle = fill;
+      ctx.fillRect(pad.left, yTop, plotW, Math.max(2, yBot - yTop));
+      ctx.strokeStyle = border;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(pad.left, yTop); ctx.lineTo(pad.left + plotW, yTop);
+      ctx.moveTo(pad.left, yBot); ctx.lineTo(pad.left + plotW, yBot);
+      ctx.stroke();
+      ctx.fillStyle = border;
+      ctx.font = "600 11px -apple-system, BlinkMacSystemFont, sans-serif";
+      ctx.fillText(`${label} ${fmtUSD(range[0])} ~ ${fmtUSD(range[1])}`, pad.left + 8, yTop + 13);
+    };
+
+    drawZone(lv.wickCeil,  "rgba(244,63,94,0.12)",  "rgba(253,164,175,0.72)", "极端轧空上限 (Wick Ceiling)");
+    drawZone(lv.coreHigh,  "rgba(16,185,129,0.12)", "rgba(110,231,183,0.72)", "预期高点磁吸 (Core High)");
+    drawZone(lv.coreLow,   "rgba(56,189,248,0.12)", "rgba(125,211,252,0.72)", "预期低点磁吸 (Core Low)");
+    drawZone(lv.wickFloor, "rgba(245,158,11,0.12)", "rgba(252,211,77,0.72)",  "极端插针底线 (Wick Floor)");
+
+    // 2. 背景价格网格与右侧刻度
+    const stepP = (maxP - minP) > 14000 ? 2000 : 1000;
+    const firstGridP = Math.ceil(minP / stepP) * stepP;
+    ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+    for (let p = firstGridP; p <= maxP; p += stepP) {
+      const y = yOf(p);
+      ctx.strokeStyle = "rgba(37, 48, 71, 0.45)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + plotW, y);
+      ctx.stroke();
+      ctx.fillStyle = "#8b9bb4";
+      ctx.fillText("$" + p.toLocaleString("en-US"), pad.left + plotW + 6, y + 4);
+    }
+
+    // 3. 底部时间轴网格（按美东时间 EST 标注）
+    const totalHours = (endTs - startTs) / 3600000;
+    const hourStep = totalHours > 26 ? 4 : 3;
+    for (let h = 0; h <= totalHours; h += hourStep) {
+      const ts = startTs + h * 3600 * 1000;
+      const x = xOf(ts);
+      ctx.strokeStyle = "rgba(37, 48, 71, 0.40)";
+      ctx.beginPath();
+      ctx.moveTo(x, pad.top); ctx.lineTo(x, pad.top + plotH);
+      ctx.stroke();
+
+      const label = new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/New_York",
+        month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+      }).format(new Date(ts)).replace(", ", " ");
+      ctx.fillStyle = "#8b9bb4";
+      const textX = Math.min(Math.max(pad.left, x - 34), pad.left + plotW - 68);
+      ctx.fillText(label, textX, pad.top + plotH + 21);
+    }
+
+    // 4. 绘制关键水平参考线 (熔断线、Gamma Flip、AVWAP)
+    const drawRefLine = (price, color, dash, tagText) => {
+      if (!price) return;
+      const y = yOf(price);
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.setLineDash(dash);
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.moveTo(pad.left, y); ctx.lineTo(pad.left + plotW, y);
+      ctx.stroke();
+      ctx.font = "600 11px ui-monospace, monospace";
+      const tw = ctx.measureText(tagText).width;
+      ctx.fillStyle = "rgba(11, 15, 23, 0.82)";
+      ctx.fillRect(pad.left + plotW - tw - 12, y - 14, tw + 8, 13);
+      ctx.fillStyle = color;
+      ctx.fillText(tagText, pad.left + plotW - tw - 8, y - 4);
+      ctx.restore();
+    };
+
+    drawRefLine(lv.cbUp,   "#f43f5e", [4, 4], `向上熔断 ${fmtUSD(lv.cbUp)}`);
+    drawRefLine(lv.flip,   "#a78bfa", [5, 4], `Gamma Flip ${fmtUSD(lv.flip)}`);
+    drawRefLine(lv.avwap,  "#f59e0b", [5, 4], `AVWAP ${fmtUSD(lv.avwap)}`);
+    drawRefLine(lv.cbDown, "#f43f5e", [4, 4], `向下熔断 ${fmtUSD(lv.cbDown)}`);
+
+    // 5. 底部 15m 实时成交量柱
+    if (visibleCandles.length > 1) {
+      const maxVol = Math.max(...visibleCandles.map((c) => c.v || 1), 1);
+      const volMaxH = plotH * 0.14;
+      const barW = Math.max(2, (plotW / ((endTs - startTs) / (15 * 60 * 1000))) * 0.68);
+      visibleCandles.forEach((c) => {
+        if (c.ts < startTs || c.ts > endTs) return;
+        const x = xOf(c.ts);
+        const bh = ((c.v || 0) / maxVol) * volMaxH;
+        ctx.fillStyle = c.c >= c.o ? "rgba(16, 185, 129, 0.28)" : "rgba(244, 63, 94, 0.28)";
+        ctx.fillRect(x - barW / 2, pad.top + plotH - bh, barW, bh);
+      });
+    }
+
+    // 6. 绘制模拟预测曲线 (白色虚线)
+    ctx.save();
+    ctx.strokeStyle = "rgba(226, 232, 240, 0.82)";
+    ctx.lineWidth = 2.1;
+    ctx.setLineDash([6, 5]);
+    ctx.beginPath();
+    const sampleCount = 200;
+    for (let i = 0; i <= sampleCount; i++) {
+      const ts = startTs + ((endTs - startTs) * i) / sampleCount;
+      const x = xOf(ts);
+      const y = yOf(interpolateForecast(ts));
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    // 阶段剧本文字标注 (仅在宽屏且存在剧本标注时显示)
+    if (W >= 820 && activeScript.annotations && activeScript.annotations.length) {
+      ctx.save();
+      ctx.font = "11.5px -apple-system, BlinkMacSystemFont, sans-serif";
+      activeScript.annotations.forEach((ann) => {
+        const ax = xOf(startTs + ann.h * 3600 * 1000);
+        const ay = yOf(ann.price);
+        const tw = ctx.measureText(ann.text).width;
+        const bx = Math.min(Math.max(pad.left + 8, ax - tw / 2), pad.left + plotW - tw - 12);
+        ctx.fillStyle = "rgba(13, 19, 32, 0.82)";
+        ctx.fillRect(bx - 5, ay - 12, tw + 10, 17);
+        ctx.fillStyle = "#cbd5e1";
+        ctx.fillText(ann.text, bx, ay);
+      });
+      ctx.restore();
+    }
+
+    // 7. 绘制实时行情 15m 影线包络 + 实时收盘轨迹 (高亮青蓝实线)
+    const clipped = visibleCandles.filter((c) => c.ts >= startTs && c.ts <= endTs);
+    if (clipped.length > 0) {
+      // 15m 高低影线包络带 (直观展示是否插针触碰磁吸带)
+      ctx.save();
+      ctx.fillStyle = "rgba(56, 189, 248, 0.16)";
+      ctx.beginPath();
+      clipped.forEach((c, idx) => {
+        const x = xOf(c.ts), y = yOf(c.h);
+        if (idx === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      for (let i = clipped.length - 1; i >= 0; i--) {
+        ctx.lineTo(xOf(clipped[i].ts), yOf(clipped[i].l));
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+
+      // 实时收盘主线
+      ctx.save();
+      ctx.strokeStyle = "#38bdf8";
+      ctx.lineWidth = 2.6;
+      ctx.shadowColor = "rgba(56, 189, 248, 0.45)";
+      ctx.shadowBlur = 8;
+      ctx.beginPath();
+      clipped.forEach((c, idx) => {
+        const x = xOf(c.ts), y = yOf(c.c);
+        if (idx === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+
+      // 最新实时价格圆点与当前进度竖线
+      const lastBar = clipped[clipped.length - 1];
+      const lx = xOf(lastBar.ts);
+      const ly = yOf(lastBar.c);
+
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = "rgba(56, 189, 248, 0.35)";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(lx, pad.top); ctx.lineTo(lx, pad.top + plotH);
+      ctx.stroke();
+
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#38bdf8";
+      ctx.beginPath();
+      ctx.arc(lx, ly, 4.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // 8. 鼠标悬停十字光标与实时误差浮窗
+    if (compareHoverX !== null && compareHoverX >= pad.left && compareHoverX <= pad.left + plotW) {
+      const hoverTs = startTs + ((compareHoverX - pad.left) / plotW) * (endTs - startTs);
+      const predAtHover = interpolateForecast(hoverTs);
+
+      ctx.save();
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.35)";
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(compareHoverX, pad.top);
+      ctx.lineTo(compareHoverX, pad.top + plotH);
+      ctx.stroke();
+      ctx.restore();
+
+      let liveRowHtml = `<span style="color:#64748b">尚未到达该时刻</span>`;
+      if (clipped.length > 0) {
+        let nearest = clipped[0];
+        for (const bar of clipped) {
+          if (Math.abs(bar.ts - hoverTs) < Math.abs(nearest.ts - hoverTs)) nearest = bar;
+        }
+        if (Math.abs(nearest.ts - hoverTs) <= 18 * 60 * 1000) {
+          const d = nearest.c - predAtHover;
+          const dp = (d / predAtHover) * 100;
+          const col = d >= 0 ? "#10b981" : "#f43f5e";
+          liveRowHtml = `<strong style="color:#38bdf8">${fmtUSD(nearest.c)}</strong> <span style="color:${col}">(${d >= 0 ? "+" : ""}${d.toFixed(1)} / ${d >= 0 ? "+" : ""}${dp.toFixed(2)}%)</span><br/><span>15m 高/低:</span> ${fmtUSD(nearest.h)} / ${fmtUSD(nearest.l)}`;
+        }
+      }
+
+      const estTimeStr = new Intl.DateTimeFormat("zh-CN", {
+        timeZone: "America/New_York",
+        month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+      }).format(new Date(hoverTs));
+
+      tooltip.style.display = "block";
+      tooltip.innerHTML = `
+        <div><span style="color:#8b9bb4">美东时间:</span> <strong>${estTimeStr} EST</strong></div>
+        <div><span style="color:#8b9bb4">预测点位:</span> <strong>${fmtUSD(predAtHover)}</strong></div>
+        <div><span style="color:#8b9bb4">实盘成交:</span> ${liveRowHtml}</div>
+      `;
+      const tipLeft = (compareHoverX + 14 + tooltip.offsetWidth > W - 10)
+        ? Math.max(8, compareHoverX - tooltip.offsetWidth - 14)
+        : compareHoverX + 14;
+      tooltip.style.left = tipLeft + "px";
+      tooltip.style.top = (pad.top + 10) + "px";
+    } else {
+      tooltip.style.display = "none";
+    }
+  }
+
+  function pushLiveTick(price, tsMs) {
+    if (!price || isNaN(price)) return;
+    const ts = tsMs || Date.now();
+    const bucket = Math.floor(ts / (15 * 60 * 1000)) * (15 * 60 * 1000);
+    if (!candleSeries.length) {
+      candleSeries.push({ ts: bucket, o: price, h: price, l: price, c: price, v: 0 });
+    } else {
+      const last = candleSeries[candleSeries.length - 1];
+      if (bucket > last.ts) {
+        candleSeries.push({ ts: bucket, o: last.c, h: Math.max(last.c, price), l: Math.min(last.c, price), c: price, v: 0 });
+      } else {
+        last.c = price;
+        last.h = Math.max(last.h, price);
+        last.l = Math.min(last.l, price);
+      }
+    }
+    updateCompareMetaAndMetrics();
+    renderComparisonChart();
+  }
+
+  async function fetchCandles() {
+    try {
+      const qs = activeScript.isCustomReanchor ? `?start_ms=${Math.floor(activeScript.startTs)}` : "";
+      const res = await fetch("/api/candles" + qs);
+      const json = await res.json();
+      if (json && Array.isArray(json.candles) && json.candles.length > 0) {
+        candleSeries = json.candles;
+        candleSourceLabel = json.source || "OKX/DERIBIT";
+      } else if (json && json.error) {
+        candleSourceLabel = "使用快照点位回传";
+      }
+      updateCompareMetaAndMetrics();
+      renderComparisonChart();
+    } catch (e) {
+      console.warn("Candles fetch warning:", e);
+    }
+  }
+
+  function connectRealtimeTickerWs() {
+    if (liveWs) {
+      try { liveWs.close(); } catch (_) {}
+      liveWs = null;
+    }
+    if (currentMode !== "LIVE") return;
+
+    const connectDeribitWs = () => {
+      try {
+        const ws = new WebSocket("wss://www.deribit.com/ws/api/v2");
+        liveWs = ws;
+        ws.onopen = () => {
+          ws.send(JSON.stringify({
+            jsonrpc: "2.0", id: 1, method: "public/subscribe",
+            params: { channels: ["ticker.BTC-PERPETUAL.100ms"] },
+          }));
+        };
+        ws.onmessage = (ev) => {
+          if (currentMode !== "LIVE") return;
+          const msg = JSON.parse(ev.data);
+          const data = msg?.params?.data;
+          if (data && data.last_price) {
+            pushLiveTick(Number(data.last_price), Number(data.timestamp || Date.now()));
+          }
+        };
+      } catch (_) {}
+    };
+
+    try {
+      const ws = new WebSocket("wss://ws.okx.com:8443/ws/v5/public");
+      liveWs = ws;
+      let gotTick = false;
+      const fallbackTimer = setTimeout(() => {
+        if (!gotTick && currentMode === "LIVE") {
+          try { ws.close(); } catch (_) {}
+          connectDeribitWs();
+        }
+      }, 6000);
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ op: "subscribe", args: [{ channel: "tickers", instId: "BTC-USDT-SWAP" }] }));
+      };
+      ws.onmessage = (ev) => {
+        if (currentMode !== "LIVE") return;
+        const msg = JSON.parse(ev.data);
+        if (msg.data && msg.data[0] && msg.data[0].last) {
+          gotTick = true;
+          clearTimeout(fallbackTimer);
+          pushLiveTick(Number(msg.data[0].last), Number(msg.data[0].ts || Date.now()));
+        }
+      };
+      ws.onerror = () => {
+        clearTimeout(fallbackTimer);
+        if (!gotTick) connectDeribitWs();
+      };
+    } catch (_) {
+      connectDeribitWs();
+    }
+  }
+
+  (function bindCompareCanvasEvents() {
+    const canvas = document.getElementById("forecastCompareCanvas");
+    const updateHover = (clientX) => {
+      const rect = canvas.getBoundingClientRect();
+      compareHoverX = clientX - rect.left;
+      renderComparisonChart();
+    };
+    canvas.addEventListener("mousemove", (e) => updateHover(e.clientX));
+    canvas.addEventListener("touchmove", (e) => {
+      if (e.touches && e.touches[0]) updateHover(e.touches[0].clientX);
+    }, { passive: true });
+    canvas.addEventListener("mouseleave", () => {
+      compareHoverX = null;
+      renderComparisonChart();
+    });
+    canvas.addEventListener("touchend", () => {
+      compareHoverX = null;
+      renderComparisonChart();
+    });
+    window.addEventListener("resize", renderComparisonChart);
+  })();
+
+  // =========================================================================
+  // 原有极值磁吸阶梯 & GEX 柱状图渲染逻辑
+  // =========================================================================
   function renderLadder(pred, meta) {
     const el = document.getElementById("ladderCanvas");
     const points = [
@@ -771,6 +1625,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   function applyStateToUI(resp) {
+    const prevMode = currentMode;
     currentMode = resp.mode || "LIVE";
     countdownSec = resp.seconds_to_next_refresh ?? 300;
     document.getElementById("lastUpdated").textContent = resp.last_updated_utc || "--";
@@ -791,7 +1646,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       errBar.style.display = "none";
     }
 
+    if (prevMode !== currentMode) {
+      connectRealtimeTickerWs();
+      fetchCandles();
+    }
+
     if (!resp.data) return;
+    latestSnapshotData = resp.data;
 
     const { prediction: pred, market_meta: meta, alert, strike_gex_bars: bars, regime_label, active_exchange, failover_reason } = resp.data;
 
@@ -849,6 +1710,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     renderLadder(pred, meta);
     renderGexChart(bars || [], meta);
 
+    if (currentMode === "LIVE" && pred.spot_price) {
+      pushLiveTick(pred.spot_price, Date.now());
+    } else {
+      updateCompareMetaAndMetrics();
+      renderComparisonChart();
+    }
+
     document.getElementById("diagContracts").textContent = `Deribit 活跃合约: ${meta.active_contracts}`;
     const d = pred.diagnostics || {};
     document.getElementById("diagBox").innerHTML = `
@@ -877,6 +1745,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const res = await fetch("/api/refresh", { method: "POST" });
       const json = await res.json();
       applyStateToUI(json);
+      await fetchCandles();
     } finally {
       btn.disabled = false;
       btn.textContent = "立即刷新";
@@ -892,6 +1761,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     });
     const json = await res.json();
     applyStateToUI(json);
+    await fetchCandles();
   }
 
   async function applyConfig() {
@@ -909,6 +1779,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     });
     const json = await res.json();
     applyStateToUI(json);
+    await fetchCandles();
   }
 
   setInterval(() => {
@@ -917,13 +1788,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       document.getElementById("countdown").textContent = countdownSec;
     } else {
       fetchSnapshot();
+      fetchCandles();
     }
   }, 1000);
 
-  fetchSnapshot().then(() => {
+  renderComparisonChart();
+  Promise.all([fetchSnapshot(), fetchCandles()]).then(() => {
+    connectRealtimeTickerWs();
     setTimeout(() => {
       if (document.getElementById("kpiSpot").textContent === "--") {
         fetchSnapshot();
+        fetchCandles();
       }
     }, 2500);
   });
